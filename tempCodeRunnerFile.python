@@ -1,0 +1,217 @@
+# Create a FastAPI + Postgres backend scaffold and zip it for download.
+# The scaffold uses SQLModel (SQLAlchemy) and supports either PostgreSQL via DATABASE_URL
+# or falls back to SQLite for quick local dev. Includes docker-compose with Postgres service.
+import os, textwrap, zipfile, json, pathlib, shutil
+root = "/mnt/data/pharmacist-agency-backend"
+if os.path.exists(root):
+    shutil.rmtree(root)
+os.makedirs(root, exist_ok=True)
+
+def write(path, content):
+    full = os.path.join(root, path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as f:
+        f.write(content)
+
+# pyproject / requirements
+write("pyproject.toml", textwrap.dedent("""\
+[project]
+name = "pharmacist-agency-backend"
+version = "0.1.0"
+dependencies = [
+  "fastapi[all]>=0.100.0",
+  "uvicorn[standard]>=0.22.0",
+  "sqlmodel>=0.0.8",
+  "psycopg2-binary>=2.9.6",
+  "alembic>=1.11.1"
+]
+"""))
+
+write("requirements.txt", "\n".join([
+    "fastapi[all]>=0.100.0",
+    "uvicorn[standard]>=0.22.0",
+    "sqlmodel>=0.0.8",
+    "psycopg2-binary>=2.9.6",
+    "alembic>=1.11.1"
+]) + "\n")
+
+# app package
+write("app/__init__.py", "")
+
+write("app/models.py", textwrap.dedent("""\
+from typing import Optional, List
+from sqlmodel import SQLModel, Field, Relationship
+from datetime import datetime
+
+class AgencyRate(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    agency_id: Optional[int] = Field(default=None, foreign_key="agency.id")
+    shift: str
+    amount: float
+    unit: str
+    currency: str
+    surge_pct: Optional[float] = 0.0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class Agency(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str
+    verified: bool = False
+    rating: float = 0.0
+    rating_count: int = 0
+    regions: Optional[str] = \"\"  # comma separated for MVP
+    specialties: Optional[str] = \"\"
+    availability: Optional[str] = \"\"
+    badges: Optional[str] = \"\"
+    last_updated: Optional[str] = None
+
+    rates: List[AgencyRate] = Relationship(back_populates=\"agency\")
+
+AgencyRate.__fields__  # silence unused
+"""))
+
+write("app/crud.py", textwrap.dedent("""\
+from typing import List, Optional
+from sqlmodel import select, Session
+from .models import Agency, AgencyRate
+from sqlmodel import SQLModel
+from datetime import datetime
+
+def get_agencies(session: Session, region: Optional[str]=None, specialty: Optional[str]=None, verified: Optional[bool]=None) -> List[Agency]:
+    q = select(Agency)
+    if region:
+        q = q.where(Agency.regions.like(f\"%{region}%\"))
+    if specialty:
+        q = q.where(Agency.specialties.like(f\"%{specialty}%\"))
+    if verified is not None:
+        q = q.where(Agency.verified == verified)
+    return session.exec(q).all()
+
+def get_agency(session: Session, agency_id: int) -> Optional[Agency]:
+    return session.get(Agency, agency_id)
+
+def get_rates(session: Session, agency_id: int) -> List[AgencyRate]:
+    q = select(AgencyRate).where(AgencyRate.agency_id == agency_id)
+    return session.exec(q).all()
+
+def create_rfq(session: Session, pharmacy_org_id: int, title: str, description: str, region: str, specialty: str):
+    # Simple RFQ stub: store as AgencyRate with negative id (for demo) or just log
+    # For full implementation add RFQ model and responses.
+    print(\"RFQ created:\", title, region, specialty)
+    return {\"status\": \"ok\", \"title\": title}
+"""))
+
+write("app/main.py", textwrap.dedent("""\
+import os
+from fastapi import FastAPI, HTTPException, Depends
+from sqlmodel import create_engine, SQLModel, Session
+from .models import Agency, AgencyRate
+from .crud import get_agencies, get_agency, get_rates, create_rfq
+from pathlib import Path
+
+DATABASE_URL = os.environ.get('DATABASE_URL') or 'sqlite:///./dev.db'
+
+engine = create_engine(DATABASE_URL, echo=False, connect_args={'check_same_thread': False} if DATABASE_URL.startswith('sqlite') else {})
+
+app = FastAPI(title='Pharmacist Agency Backend', version='0.1.0')
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+@app.on_event('startup')
+def on_startup():
+    SQLModel.metadata.create_all(engine)
+    # Seed minimal data if empty
+    with Session(engine) as session:
+        count = session.exec(Agency.select()).all() if hasattr(Agency, 'select') else session.exec(select(Agency)).all()
+        if not count:
+            seed_agencies(session)
+            session.commit()
+
+def seed_agencies(session: Session):
+    # Lightweight seeding - mirrors frontend mock data
+    data = [
+        { 'name':'MediStaff Connect', 'verified':True, 'rating':4.6, 'rating_count':128, 'regions':'Mumbai,Pune', 'specialties':'Oncology,Emergency', 'availability':'24/7', 'badges':'Emergency,Weekend', 'last_updated':'2025-08-12', 'rates':[('day',420,'shift','INR',0), ('night',520,'shift','INR',0), ('weekend',600,'shift','INR',10), ('on_call',70,'hr','INR',0)] },
+        { 'name':'CarePlus Agency', 'verified':True, 'rating':4.2, 'rating_count':86, 'regions':'Mumbai', 'specialties':'General,ICU', 'availability':'Weekdays', 'badges':'ICU', 'last_updated':'2025-08-10', 'rates':[('day',410,'shift','INR',0), ('night',500,'shift','INR',0), ('weekend',590,'shift','INR',0)] },
+    ]
+    for a in data:
+        ag = Agency(name=a['name'], verified=a['verified'], rating=a['rating'], rating_count=a['rating_count'], regions=a['regions'], specialties=a['specialties'], availability=a['availability'], badges=a['badges'], last_updated=a['last_updated'])
+        session.add(ag)
+        session.flush()
+        for r in a['rates']:
+            rr = AgencyRate(agency_id=ag.id, shift=r[0], amount=r[1], unit=r[2], currency=r[3], surge_pct=r[4])
+            session.add(rr)
+
+@app.get('/agencies', tags=['agencies'])
+def list_agencies(region: str = None, specialty: str = None, verified: bool = None, session: Session = Depends(get_session)):
+    items = get_agencies(session, region=region, specialty=specialty, verified=verified)
+    return {'data': items, 'meta': {'total': len(items)}}
+
+@app.get('/agencies/{agency_id}', tags=['agencies'])
+def read_agency(agency_id: int, session: Session = Depends(get_session)):
+    ag = get_agency(session, agency_id)
+    if not ag:
+        raise HTTPException(status_code=404, detail='Agency not found')
+    return ag
+
+@app.get('/agencies/{agency_id}/rates', tags=['agencies'])
+def read_rates(agency_id: int, session: Session = Depends(get_session)):
+    rates = get_rates(session, agency_id)
+    return {'data': rates}
+
+@app.post('/rfqs', tags=['rfqs'])
+def post_rfq(payload: dict, session: Session = Depends(get_session)):
+    # Expect payload with pharmacy_org_id, title, description, region, specialty
+    res = create_rfq(session, payload.get('pharmacy_org_id', 0), payload.get('title',''), payload.get('description',''), payload.get('region',''), payload.get('specialty',''))
+    session.commit()
+    return res
+"""))
+
+write("Dockerfile", textwrap.dedent("""\
+FROM python:3.11-slim
+WORKDIR /app
+COPY pyproject.toml requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
+ENV PORT=8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+"""))
+
+write("docker-compose.yml", textwrap.dedent("""\
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: agencydb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+  api:
+    build: .
+    depends_on:
+      - db
+    environment:
+      DATABASE_URL: postgres://app:secret@db:5432/agencydb
+    ports:
+      - '8000:8000'
+volumes:
+  pgdata:
+"""))
+
+write("README.md", textwrap.dedent)
+# Pharmacist Agency Backend (FastAPI + SQLModel
+
+This is a minimal backend scaffold for the Agency Compare app.
+
+## Quick start (development with SQLite)
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+# open http://localhost:8000/docs
